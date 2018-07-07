@@ -10,7 +10,7 @@
 #include "ipc.h"
 
 #define THREAD_INIT(tid, desc) -1,
-static void * frtos_ipc_routine(void * thread);
+static void frtos_ipc_routine(void * param);
 static void frtos_ipc_delete(struct Object * const obj);
 
 static IPC_Clock_T frtos_ipc_time(union IPC_Helper * const helper);
@@ -44,7 +44,7 @@ static bool frtos_ipc_post_conditional(union IPC_Helper * const helper, union Co
 
 static void frtos_ipc_make_timespec(struct timespec * const tm, IPC_Clock_T const clock_ms);
 
-frtos_ipc_Class_T FRTOS_IPC_Class =
+FRTOS_IPC_Class_T FRTOS_IPC_Class =
     {{
    { frtos_ipc_delete, NULL},
    frtos_ipc_time,
@@ -84,8 +84,9 @@ static pthread_t FRTOS_Pool[IPC_MAX_TID] =
    IPC_THREAD_LIST(THREAD_INIT)
     };
 
-void * frtos_ipc_routine(void * thread)
+void frtos_ipc_routine(void * params)
 {
+   struct FRTOS_Thread * const thread = (struct FRTOS_Thread *) params;
    union Thread * const this = _cast(Thread, (union Thread *)thread);
 
    Isnt_Nullptr(this, NULL);
@@ -103,7 +104,7 @@ void * frtos_ipc_routine(void * thread)
 
    union Semaphore * t_sem = &this->sem_ready;
    t_sem->vtbl->post(t_sem);// thread ended wait
-   pthread_exit(NULL);
+   pthread_exit(NULL);//TODO delete task
    return NULL;
 }
 
@@ -131,14 +132,16 @@ void frtos_ipc_delete(struct Object * const obj)
 
 IPC_Clock_T frtos_ipc_time(union IPC_Helper * const helper)
 {
-  struct timespec timespec;
-  int rc = clock_gettime(CLOCK_MONOTONIC, &timespec);
-  return (rc)? 0 : (timespec.tv_sec * 1000 + timespec.tv_nsec / 1000000);
+   volatile UBaseType_t array;
+   uint32_t uptime;
+   array = uxTaskGetSystemState(NULL, 0, &uptime);
+   return frtos_ipc_make_clock(uptime);
 }
 
 void frtos_ipc_sleep(union IPC_Helper * const helper, IPC_Clock_T const sleep_ms)
 {
-  usleep(sleep_ms * 1000);
+   TickType_t const sleep_ticks = frtos_ipc_make_tick(sleep_ms);
+   vTaskDelay(sleep_ticks);
 }
 
 bool frtos_ipc_is_time_elapsed(union IPC_Helper * const helper, IPC_Clock_T const time_ms)
@@ -148,30 +151,24 @@ bool frtos_ipc_is_time_elapsed(union IPC_Helper * const helper, IPC_Clock_T cons
 
 IPC_TID_T frtos_ipc_self_thread(union IPC_Helper * const helper)
 {
-  IPC_TID_T i;
-  pthread_t self = pthread_self();
-
-  for(i = 0; i < IPC_MAX_TID; ++i)
-    {
-      if( pthread_equal(FRTOS_Pool[i], self))
-   {
-     break;
-   }
-    }
-
-  return i;
+  IPC_TID_T tid;
+  TaskHandle_t handle = xTaskGetCurrentTaskHandle();
+  tid = (IPC_TID_T) xTaskGetApplicationTaskTag(handle);
+  return tid;
 }
 
 bool frtos_ipc_alloc_thread(union IPC_Helper * const helper, union Thread * const thread)
 {
   bool rc = true;
 
-  if(-1 == FRTOS_Pool[thread->tid])
-    {
-      rc = true;
-      thread->attr = &FRTOS_Thread_Attr;
-      IPC_Register_Thread(thread);
-    }
+  if(NULL == FRTOS_Pool[thread->tid].stack)
+  {
+     rc = true;
+     thread->attr = (FRTOS_Pool + thread->tid);
+     FRTOS_Pool[thread->tid].stack = malloc(FRTOS_Thread_Attr.stack_size);
+     FRTOS_Pool[thread->tid].stack_size = FRTOS_Thread_Attr.stack_size;
+     IPC_Register_Thread(thread);
+  }
   return rc;
 }
 
@@ -179,23 +176,28 @@ bool frtos_ipc_free_thread(union IPC_Helper * const helper, union Thread * const
 {
   bool rc = false;
 
-  if(0 == pthread_cancel(FRTOS_Pool[thread->tid]))
-    {
-      FRTOS_Pool[thread->tid] = -1;
-    }
+  if(thread->attr  == (FRTOS_Pool + thread->tid))
+  {
+     vTaskDelete(FRTOS_Pool[thread->tid].handle);
+     free(FRTOS_Pool[thread->tid].stack);
+     FRTOS_Pool[thread->tid].stack_size = 0;
+  }
   return rc;
 }
 
 bool frtos_ipc_run_thread(union IPC_Helper * const helper, union Thread * const thread)
 {
-  bool rc = false;
-  if(-1 == FRTOS_Pool[thread->tid])
+  BaseType_t rc = pdPASS;
+  if(NULL == FRTOS_Pool[thread->tid].handle)
     {
-      rc = 0 == pthread_create(FRTOS_Pool + thread->tid,
-                (pthread_attr_t *)thread->attr,
-                frtos_ipc_routine, (void *)thread);
+      rc = 0 == xTaskCreate(
+           frtos_ipc_routine,
+           FRTOS_Pool[thread->tid].name,
+           thread,
+           FRTOS_Pool[thread->tid].priority,
+           FRTOS_Pool[thread->tid].handle);
     }
-  return rc;
+  return rc == pdPASS;
 }
 
 bool frtos_ipc_join_thread(union IPC_Helper * const helper, union Thread * const thread)
@@ -214,12 +216,16 @@ bool frtos_ipc_join_thread(union IPC_Helper * const helper, union Thread * const
 
 bool frtos_ipc_alloc_mutex(union IPC_Helper * const helper, union Mutex * const mutex)
 {
-  return 0 == pthread_mutex_init((pthread_mutex_t *)&mutex->mux, &FRTOS_Mux_Attr);
+   if(NULL == mutex->mux)
+   {
+      mutex->mux = xSemaphoteCreateMutex();
+   }
+   return 0 == mutex->mux;
 }
 
 bool frtos_ipc_free_mutex(union IPC_Helper * const helper, union Mutex * const mutex)
 {
-  return 0 == pthread_mutex_destroy((pthread_mutex_t *)&mutex->mux);
+  return NULL == vSemaphoreDelete((SemaphoreHandle_t )mutex->mux);
 }
 
 bool frtos_ipc_lock_mutex(union IPC_Helper * const helper, union Mutex * const mutex,
