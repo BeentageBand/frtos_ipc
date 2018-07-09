@@ -9,7 +9,20 @@
 #include "frtos_ipc.h"
 #include "ipc.h"
 
-#define THREAD_INIT(tid, desc) -1,
+#define FRTOS_THREAD_STACK_SIZE (1024 UL)
+#define THREAD_INIT(tid, desc) {NULL, 0, #tid, NULL, FRTOS_THREAD_STACK_SIZE}
+
+typedef uint32_t FRTOS_Priority_T;
+
+struct FRTOS_Thread
+{
+  TaskHandle_t handle;
+  FRTOS_Priority_T priority;
+  char * name;
+  void * stack;
+  size_t stack_size;
+};
+
 static void frtos_ipc_routine(void * param);
 static void frtos_ipc_delete(struct Object * const obj);
 
@@ -74,15 +87,11 @@ FRTOS_IPC_Class_T FRTOS_IPC_Class =
     }};
 
 static union frtos_ipc FRTOS_IPC = {NULL};
-static pthread_condattr_t FRTOS_Cond_Attr = PTHREAD_COND_INITIALIZER;
-static pthread_attr_t FRTOS_Thread_Attr;
-static pthread_mutexattr_t FRTOS_Mux_Attr;
-
-static pthread_t FRTOS_Pool[IPC_MAX_TID] =
-    {
-   -1,
+static struct FRTOS_Thread FRTOS_Pool[IPC_MAX_TID] =
+{
+   {NULL, "ID"},
    IPC_THREAD_LIST(THREAD_INIT)
-    };
+};
 
 void frtos_ipc_routine(void * params)
 {
@@ -154,7 +163,7 @@ IPC_TID_T frtos_ipc_self_thread(union IPC_Helper * const helper)
   IPC_TID_T tid;
   TaskHandle_t handle = xTaskGetCurrentTaskHandle();
   tid = (IPC_TID_T) xTaskGetApplicationTaskTag(handle);
-  return tid;
+  return (IPC_MAX_TID > tid)? tid : IPC_MAX_TID;
 }
 
 bool frtos_ipc_alloc_thread(union IPC_Helper * const helper, union Thread * const thread)
@@ -203,14 +212,7 @@ bool frtos_ipc_run_thread(union IPC_Helper * const helper, union Thread * const 
 bool frtos_ipc_join_thread(union IPC_Helper * const helper, union Thread * const thread)
 {
   bool rc = false;
-
-  if(-1 == FRTOS_Pool[thread->tid])
-    {
-      union Thread * t = NULL;
-      rc = 0 == pthread_join(FRTOS_Pool[thread->tid],
-              (void **) &t);
-    }
-
+  //TODO Join
   return rc;
 }
 
@@ -231,88 +233,101 @@ bool frtos_ipc_free_mutex(union IPC_Helper * const helper, union Mutex * const m
 bool frtos_ipc_lock_mutex(union IPC_Helper * const helper, union Mutex * const mutex,
            IPC_Clock_T const wait_ms)
 {
-  struct timespec timespec;
-  frtos_ipc_make_timespec(&timespec, wait_ms);
-
-  return 0 == pthread_mutex_timedlock((pthread_mutex_t *)&mutex->mux,
-                  &timespec);
+  Isnt_Nullptr(mutex->mux, false);
+  TickType_t wait_ticks = frtos_ipc_make_ticks(wait_ms);
+  return pdTRUE == xSemaphoreTake((SemaphoreHandle_t) mutex->mux, wait_ticks);
 }
 
 bool frtos_ipc_unlock_mutex(union IPC_Helper * const helper, union Mutex * const mutex)
 {
-  return 0 == pthread_mutex_unlock((pthread_mutex_t *)&mutex->mux);
+  Isnt_Nullptr(mutex->mux, false);
+  return  pdTrue == xSemaphoreGive((SemaphoreHandle_t)mutex->mux);
 }
 
 bool frtos_ipc_alloc_semaphore(union IPC_Helper * const helper, union Semaphore * const semaphore,
                 uint8_t const value)
 {
-  return 0 == sem_init((sem_t *)&semaphore->sem, 0, value);
+  bool rc = false;
+  if (NULL == semaphore->sem)
+  {
+    switch(value)
+    {
+      0 :
+      rc = false;
+      break;
+      1 :
+      semaphore->sem = (void *) xSemaphoreCreateBinary();
+      rc = NULL != semaphore->sem;
+      break;
+      default:
+      semaphore->sem = (void *) xSemaphoreCreateCounting(value, value);
+      rc = NULL != semaphore->sem;
+      break;
+    }
+  }
+  return rc;
 }
 
 bool frtos_ipc_free_semaphore(union IPC_Helper * const helper, union Semaphore * const semaphore)
 {
-  return 0 == sem_destroy((sem_t *)&semaphore->sem);
+  return NULL == vSemaphoreDelete((SemaphoreHandle_t )semaphore->sem);
 }
 
 bool frtos_ipc_wait_semaphore(union IPC_Helper * const helper, union Semaphore * const semaphore,
                IPC_Clock_T const wait_ms)
 {
-  struct timespec timespec;
-  frtos_ipc_make_timespec(&timespec, wait_ms);
-  return 0 == sem_timedwait((sem_t *)&semaphore->sem, &timespec);
+  Isnt_Nullptr(semaphore->sem, false);
+  TickType_t wait_ticks = frtos_ipc_make_ticks(wait_ms);
+  return pdTRUE == xSemaphoreTake((SemaphoreHandle_t) semaphore->sem, wait_ticks);
 }
 
 bool frtos_ipc_post_semaphore(union IPC_Helper * const helper, union Semaphore * const semaphore)
 {
-  return 0 == sem_post((sem_t *)&semaphore->sem);
+  Isnt_Nullptr(semaphore->sem, false);
+  return  pdTrue == xSemaphoreGive((SemaphoreHandle_t)semaphore->sem);
 }
 
 bool frtos_ipc_alloc_conditional(union IPC_Helper * const helper, union Conditional * const conditional)
 {
-  return 0 == pthread_cond_init((pthread_cond_t *)&conditional->conditional,
-            &FRTOS_Cond_Attr);
+  return 0; //TODO
 }
 
 bool frtos_ipc_free_conditional(union IPC_Helper * const helper, union Conditional * const conditional)
 {
-  return 0 == pthread_cond_destroy((pthread_cond_t *)&conditional->conditional);
+  return 0; //TODO
 }
 
 bool frtos_ipc_wait_conditional(union IPC_Helper * const helper, union Conditional * const conditional,
             union Mutex * const mutex, IPC_Clock_T const wait_ms)
 {
-  struct timespec timespec;
-  frtos_ipc_make_timespec(&timespec, wait_ms);
-  return 0 == pthread_cond_timedwait((pthread_cond_t *)&conditional->conditional,
-                 (pthread_mutex_t *)&mutex->mux, &timespec);
+  return 0; //TODO
 }
 
 bool frtos_ipc_post_conditional(union IPC_Helper * const helper, union Conditional * const conditional)
 {
-  union frtos_ipc * const this = _cast(FRTOS_IPC, helper);
-  Isnt_Nullptr(this, false);
-  return 0 == pthread_cond_signal((pthread_cond_t *)&conditional->conditional);
+  return 0; //TODO
 }
 
-void frtos_ipc_make_timespec(struct timespec * const tm, IPC_Clock_T const clock_ms)
+IPC_Clock_T frtos_ipc_make_clock(TickType_t const clock_ticks)
 {
-  tm->tv_sec = clock_ms / 1000;
-  tm->tv_nsec = clock_ms - (tm->tv_sec * 1000);
-  tm->tv_nsec *= 1000000;
+  return (IPC_Clock_T)(clock_ticks * FRTOS_MS_PER_CLOCK);
+
+}
+
+TickType_t frtos_ipc_make_ticks(IPC_Clock_T const clock_ms)
+{
+  return (TickType_t)(clock_ticks / FRTOS_MS_PER_CLOCK);
 }
 
 void Populate_frtos_ipc(union FRTOS_IPC * const this)
 {
 
-  if(NULL == frtos_ipc.vtbl)
+  if(NULL == FRTOS_IPC.vtbl)
     {
-      FRTOS_Pool[IPC_MAIN_TID] = pthread_self();
-      Dbg_Warn("Start IPC FRTOS: starter thread %d is IPC_MAIN_TID", FRTOS_Pool[IPC_MAIN_TID]);
-      Populate_IPC_Helper(&frtos_ipc.IPC_Helper);
+      Populate_IPC_Helper(&FRTOS_IPC.IPC_Helper);
       Object_Init(&frtos_ipc.Object, &FRTOS_IPC_Class.Class, 0);
-      pthread_condattr_init(&FRTOS_Cond_Attr);
-      pthread_attr_init(&FRTOS_Thread_Attr);
-      pthread_mutexattr_init(&FRTOS_Mux_Attr);
+      FRTOS_Pool[IPC_MAIN_TID] = FRTOS_IPC.vtbl->self_thread(&FRTOS_IPC);
+      Dbg_Warn("Start IPC FRTOS: starter thread %d is IPC_MAIN_TID", FRTOS_Pool[IPC_MAIN_TID]);
     }
-  memcpy(this, &frtos_ipc, sizeof(FRTOS_IPC));
+  memcpy(this, &FRTOS_IPC, sizeof(FRTOS_IPC));
 }
